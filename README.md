@@ -23,9 +23,15 @@ Binance-AI-Assistant/
 ├─ Installer.js           # Scriptable 安装器/更新器
 ├─ Installer.txt          # 便于 iOS 浏览器复制的安装器文本
 ├─ src/
-│  └─ BinanceSync.js      # 主同步脚本
+│  ├─ manifest.json       # 版本、片段顺序和完整性信息
+│  └─ chunks/
+│     ├─ part-01.txt
+│     ├─ ...
+│     └─ part-06.txt      # 安装时拼接为 Binance Sync.js
 └─ CHANGELOG.md
 ```
+
+主脚本采用分片存储，是为了避免 iOS 无法直接打开较大的 `.js` 文件。安装器会自动下载、拼接和校验，安装后在 Scriptable 中仍然只有一个完整的 `Binance Sync` 脚本。
 
 ## iOS 安装
 
@@ -36,13 +42,15 @@ Binance-AI-Assistant/
 3. 打开 Scriptable，点击右上角 `+` 新建脚本。
 4. 粘贴内容，命名为 `Install Binance AI Assistant`。
 5. 运行安装器，选择安装到 iCloud 或本机。
-6. 安装完成后运行自动生成的 `Binance Sync`。
+6. 安装器会读取 `src/manifest.json`，顺序下载全部代码片段并校验总长度。
+7. 安装完成后运行自动生成的 `Binance Sync`。
 
 ### 后续更新
 
 重新运行 `Install Binance AI Assistant`。安装器会：
 
-- 从本仓库下载最新的 `src/BinanceSync.js`；
+- 读取最新版本清单并下载全部代码片段；
+- 拼接并校验完整主脚本；
 - 自动备份旧版本到 Scriptable 的 `Backups` 目录；
 - 覆盖安装最新版本；
 - 保留 Keychain 中已经保存的密钥和配置。
