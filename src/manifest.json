@@ -1,0 +1,15 @@
+{
+  "version": "0.4.0",
+  "entry": "Binance Sync.js",
+  "parts": [
+    "chunks/part-01.txt",
+    "chunks/part-02.txt",
+    "chunks/part-03.txt",
+    "chunks/part-04.txt",
+    "chunks/part-05.txt",
+    "chunks/part-06.txt"
+  ],
+  "length": 44385,
+  "sha256": "b24fd4b50bb86419af66733cdeb46ad020e6733ad154dd0ee7b4a575bd42c58c",
+  "marker": "Binance USD-M Futures -> GitHub current snapshot"
+}
