@@ -1,0 +1,231 @@
+  if ((await secretAlert.presentAlert()) === -1) {
+    throw new Error("已取消设置");
+  }
+
+  const binanceApiKey = secretAlert.textFieldValue(0).trim();
+  const binanceApiSecret = secretAlert.textFieldValue(1).trim();
+  const githubToken = secretAlert.textFieldValue(2).trim();
+
+  if (!binanceApiKey || !binanceApiSecret || !githubToken) {
+    throw new Error("API Key、Secret 和 GitHub Token 均不能为空");
+  }
+
+  const repoAlert = new Alert();
+  repoAlert.title = "GitHub 仓库设置";
+  repoAlert.message = "仓库必须已存在。目录无需预建；脚本会直接创建 binance/latest.json。若仓库完全为空，请先在 GitHub 创建 README，使 main 分支存在。";
+  repoAlert.addTextField("GitHub 用户名/组织名", existing.owner || "A1rChina");
+  repoAlert.addTextField("仓库名", existing.repo || "sa");
+  repoAlert.addTextField("分支", existing.branch || "main");
+  repoAlert.addTextField(
+    "文件路径",
+    existing.path || "binance/latest.json",
+  );
+  repoAlert.addAction("保存并同步");
+  repoAlert.addCancelAction("取消");
+
+  if ((await repoAlert.presentAlert()) === -1) {
+    throw new Error("已取消设置");
+  }
+
+  const cfg = {
+    owner: repoAlert.textFieldValue(0).trim(),
+    repo: repoAlert.textFieldValue(1).trim(),
+    branch: repoAlert.textFieldValue(2).trim() || "main",
+    path: repoAlert.textFieldValue(3).trim().replace(/^\/+/, ""),
+  };
+
+  if (!cfg.owner || !cfg.repo || !cfg.path) {
+    throw new Error("GitHub 用户名、仓库名和文件路径不能为空");
+  }
+
+  Keychain.set(KEY.binanceApiKey, binanceApiKey);
+  Keychain.set(KEY.binanceApiSecret, binanceApiSecret);
+  Keychain.set(KEY.githubToken, githubToken);
+  Keychain.set(KEY.config, JSON.stringify(cfg));
+}
+
+async function clearConfiguration() {
+  if (!config.runsInApp) {
+    throw new Error("清除配置只能在 Scriptable App 内执行");
+  }
+
+  const alert = new Alert();
+  alert.title = "清除全部密钥？";
+  alert.message = "此操作会删除 Scriptable Keychain 中保存的 Binance 与 GitHub 凭据。";
+  alert.addDestructiveAction("清除");
+  alert.addCancelAction("取消");
+
+  if ((await alert.presentAlert()) !== 0) return;
+
+  for (const key of Object.values(KEY)) {
+    if (Keychain.contains(key)) Keychain.remove(key);
+  }
+
+  const done = new Alert();
+  done.title = "已清除";
+  done.message = "下次运行脚本时会重新进入设置。";
+  done.addAction("好");
+  await done.presentAlert();
+}
+
+async function buildSnapshot(credentials, serverTime, timeOffset) {
+  const balancesRaw = await binanceSignedGet(
+    "/fapi/v3/balance",
+    {},
+    credentials,
+    timeOffset,
+  );
+
+  const positionsRaw = await binanceSignedGet(
+    "/fapi/v3/positionRisk",
+    {},
+    credentials,
+    timeOffset,
+  );
+
+  // 全市场挂单查询权重较高，因此建议按需运行或每天自动运行一次。
+  const openOrdersRaw = await binanceSignedGet(
+    "/fapi/v1/openOrders",
+    {},
+    credentials,
+    timeOffset,
+  );
+
+  const openAlgoOrdersRaw = await binanceSignedGet(
+    "/fapi/v1/openAlgoOrders",
+    {},
+    credentials,
+    timeOffset,
+  );
+
+  const assets = balancesRaw
+    .filter((item) =>
+      [item.balance, item.availableBalance, item.crossUnPnl]
+        .map(Number)
+        .some((value) => Number.isFinite(value) && Math.abs(value) > 0),
+    )
+    .map((item) => ({
+      asset: item.asset,
+      walletBalance: toNumber(item.balance),
+      crossWalletBalance: toNumber(item.crossWalletBalance),
+      crossUnrealizedPnl: toNumber(item.crossUnPnl),
+      availableBalance: toNumber(item.availableBalance),
+      maxWithdrawAmount: toNumber(item.maxWithdrawAmount),
+      marginAvailable: Boolean(item.marginAvailable),
+      updateTime: Number(item.updateTime || 0),
+    }));
+
+  const positions = positionsRaw
+    .filter((item) => Math.abs(toNumber(item.positionAmt)) > 0)
+    .map((item) => {
+      const signedQuantity = toNumber(item.positionAmt);
+      const side =
+        item.positionSide === "LONG"
+          ? "LONG"
+          : item.positionSide === "SHORT"
+            ? "SHORT"
+            : signedQuantity >= 0
+              ? "LONG"
+              : "SHORT";
+
+      return {
+        symbol: item.symbol,
+        side,
+        positionSide: item.positionSide,
+        quantity: Math.abs(signedQuantity),
+        signedQuantity,
+        entryPrice: toNumber(item.entryPrice),
+        breakEvenPrice: toNumber(item.breakEvenPrice),
+        markPrice: toNumber(item.markPrice),
+        liquidationPrice: toNumber(item.liquidationPrice),
+        unrealizedPnl: toNumber(item.unRealizedProfit),
+        notional: toNumber(item.notional),
+        leverage: toNumber(item.leverage),
+        marginType: item.marginType,
+        isolatedMargin: toNumber(item.isolatedMargin),
+        initialMargin: toNumber(item.initialMargin),
+        maintenanceMargin: toNumber(item.maintMargin),
+        updateTime: Number(item.updateTime || 0),
+      };
+    });
+
+  const openOrders = openOrdersRaw.map((item) => ({
+    symbol: item.symbol,
+    side: item.side,
+    positionSide: item.positionSide,
+    type: item.type,
+    originalType: item.origType,
+    status: item.status,
+    price: toNumber(item.price),
+    stopPrice: toNumber(item.stopPrice),
+    originalQuantity: toNumber(item.origQty),
+    executedQuantity: toNumber(item.executedQty),
+    reduceOnly: Boolean(item.reduceOnly),
+    closePosition: Boolean(item.closePosition),
+    workingType: item.workingType,
+    timeInForce: item.timeInForce,
+    updateTime: Number(item.updateTime || 0),
+  }));
+
+  const openAlgoOrders = openAlgoOrdersRaw.map((item) => ({
+    symbol: item.symbol,
+    side: item.side,
+    positionSide: item.positionSide,
+    orderType: item.orderType,
+    status: item.algoStatus,
+    quantity: toNumber(item.quantity),
+    triggerPrice: toNumber(item.triggerPrice),
+    price: toNumber(item.price),
+    takeProfitTriggerPrice: toNumber(item.tpTriggerPrice),
+    stopLossTriggerPrice: toNumber(item.slTriggerPrice),
+    reduceOnly: Boolean(item.reduceOnly),
+    closePosition: Boolean(item.closePosition),
+    workingType: item.workingType,
+    createTime: Number(item.createTime || 0),
+    updateTime: Number(item.updateTime || 0),
+  }));
+
+  const usdt = assets.find((item) => item.asset === "USDT") || null;
+  const positionUnrealizedPnl = sum(positions.map((item) => item.unrealizedPnl));
+  const grossNotional = sum(positions.map((item) => Math.abs(item.notional)));
+  const netNotional = sum(positions.map((item) => item.notional));
+  const longNotional = sum(
+    positions
+      .filter((item) => item.side === "LONG")
+      .map((item) => Math.abs(item.notional)),
+  );
+  const shortNotional = sum(
+    positions
+      .filter((item) => item.side === "SHORT")
+      .map((item) => Math.abs(item.notional)),
+  );
+  const walletBalance = usdt ? usdt.walletBalance : 0;
+  const estimatedEquity = walletBalance + positionUnrealizedPnl;
+  const initialMargin = sum(positions.map((item) => item.initialMargin));
+  const maintenanceMargin = sum(
+    positions.map((item) => item.maintenanceMargin),
+  );
+
+  return {
+    schemaVersion: 2,
+    exchange: "binance",
+    market: "USD_M_FUTURES",
+    generatedAt: new Date(serverTime).toISOString(),
+    generatedFrom: "Scriptable on iPhone",
+    summary: {
+      walletBalanceUSDT: walletBalance,
+      availableBalanceUSDT: usdt ? usdt.availableBalance : 0,
+      positionUnrealizedPnlUSDT: positionUnrealizedPnl,
+      estimatedEquityUSDT: estimatedEquity,
+      initialMarginUSDT: initialMargin,
+      maintenanceMarginUSDT: maintenanceMargin,
+      marginUsagePct:
+        estimatedEquity > 0 ? (initialMargin / estimatedEquity) * 100 : null,
+      grossNotionalUSDT: grossNotional,
+      netNotionalUSDT: netNotional,
+      longNotionalUSDT: longNotional,
+      shortNotionalUSDT: shortNotional,
+      activePositionCount: positions.length,
+      openOrderCount: openOrders.length,
+      openAlgoOrderCount: openAlgoOrders.length,
+    },
