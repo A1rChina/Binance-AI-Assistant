@@ -1,0 +1,269 @@
+    assets,
+    positions,
+    orders: {
+      ordinary: openOrders,
+      conditional: openAlgoOrders,
+    },
+    privacy: {
+      omitted: [
+        "Binance API key and secret",
+        "GitHub token",
+        "raw orderId",
+        "raw clientOrderId",
+        "raw transaction ID",
+        "account UID",
+      ],
+    },
+    notes: [
+      "This snapshot is read-only and may become stale after generation.",
+      "Performance tracking begins from index.startedAt and does not backfill older data.",
+      "A precise per-trade risk percentage still requires a valid protective stop price.",
+    ],
+  };
+}
+
+function deriveLedgerPaths(latestPath) {
+  const clean = String(latestPath || "binance/latest.json").replace(/^\/+/, "");
+  const slashIndex = clean.lastIndexOf("/");
+  const baseDir = slashIndex >= 0 ? clean.slice(0, slashIndex) : "binance";
+
+  return {
+    latest: clean,
+    index: `${baseDir}/index.json`,
+    historyDir: `${baseDir}/history`,
+  };
+}
+
+function determineTrackingWindow(options) {
+  const index = options.existingIndex;
+  const previousLatest = options.previousLatest;
+  const currentSnapshot = options.currentSnapshot;
+  const serverTime = options.serverTime;
+
+  const priorStart =
+    index && isValidIsoDate(index.startedAt)
+      ? Date.parse(index.startedAt)
+      : previousLatest && isValidIsoDate(previousLatest.generatedAt)
+        ? Date.parse(previousLatest.generatedAt)
+        : serverTime;
+
+  const priorSync =
+    index && isValidIsoDate(index.lastSyncAt)
+      ? Date.parse(index.lastSyncAt)
+      : priorStart;
+
+  // 重叠一小时，处理接口延迟；后续依靠 recordKey 去重。
+  const overlapMs = 60 * 60 * 1000;
+  const incomeRetentionMs = 89 * 24 * 60 * 60 * 1000;
+  const rawStart = Math.max(priorStart, priorSync - overlapMs);
+  const retentionFloor = serverTime - incomeRetentionMs;
+  const dataGapDetected = rawStart < retentionFloor;
+  const queryStartTime = Math.max(rawStart, retentionFloor);
+
+  const baseline =
+    index && index.baseline
+      ? index.baseline
+      : previousLatest
+        ? baselineFromSnapshot(previousLatest)
+        : baselineFromSnapshot(currentSnapshot);
+
+  return {
+    startedAt: new Date(priorStart).toISOString(),
+    previousSyncAt: new Date(priorSync).toISOString(),
+    queryStartTime,
+    queryEndTime: serverTime,
+    dataGapDetected,
+    baseline,
+  };
+}
+
+function baselineFromSnapshot(snapshot) {
+  const summary = snapshot && snapshot.summary ? snapshot.summary : {};
+  const positions =
+    snapshot && Array.isArray(snapshot.positions) ? snapshot.positions : [];
+
+  return {
+    at:
+      snapshot && isValidIsoDate(snapshot.generatedAt)
+        ? snapshot.generatedAt
+        : new Date().toISOString(),
+    walletBalanceUSDT: toNumber(summary.walletBalanceUSDT),
+    estimatedEquityUSDT: toNumber(summary.estimatedEquityUSDT),
+    unrealizedPnlUSDT: toNumber(summary.positionUnrealizedPnlUSDT),
+    preExistingPositions: positions.map((item) => ({
+      symbol: item.symbol,
+      side: item.side,
+      quantity: toNumber(item.quantity),
+      entryPrice: toNumber(item.entryPrice),
+    })),
+  };
+}
+
+async function collectForwardData(options) {
+  const warnings = [];
+  const duration = options.endTime - options.startTime;
+
+  if (duration < 1000) {
+    return {
+      income: [],
+      trades: [],
+      knownSymbols: symbolsFromSnapshot(options.currentSnapshot),
+      warnings,
+      tradeQueryTruncated: false,
+      incomeQueryTruncated: false,
+    };
+  }
+
+  const incomeResult = await fetchIncomeHistory({
+    credentials: options.credentials,
+    timeOffset: options.timeOffset,
+    startTime: options.startTime,
+    endTime: options.endTime,
+  });
+
+  if (incomeResult.truncated) {
+    warnings.push("资金流水超过本次分页上限，可能需要缩短同步间隔后重试。");
+  }
+
+  const symbolSet = new Set(symbolsFromSnapshot(options.currentSnapshot));
+
+  if (
+    options.existingIndex &&
+    Array.isArray(options.existingIndex.knownSymbols)
+  ) {
+    for (const symbol of options.existingIndex.knownSymbols) {
+      if (symbol) symbolSet.add(String(symbol));
+    }
+  }
+
+  for (const item of incomeResult.records) {
+    if (item.symbol) symbolSet.add(item.symbol);
+  }
+
+  // 只查询本次窗口内出现资金流水的交易对，避免无意义地扫描所有历史标的。
+  const activeIncomeSymbols = Array.from(
+    new Set(
+      incomeResult.records
+        .map((item) => item.symbol)
+        .filter((symbol) => Boolean(symbol)),
+    ),
+  );
+
+  const tradeResult = await fetchTradesForSymbols({
+    credentials: options.credentials,
+    timeOffset: options.timeOffset,
+    symbols: activeIncomeSymbols,
+    startTime: options.startTime,
+    endTime: options.endTime,
+  });
+
+  if (tradeResult.truncated) {
+    warnings.push("至少一个交易对在单个查询窗口达到1000条成交上限，成交明细可能不完整。");
+  }
+
+  return {
+    income: incomeResult.records,
+    trades: tradeResult.records,
+    knownSymbols: Array.from(symbolSet).sort(),
+    warnings,
+    tradeQueryTruncated: tradeResult.truncated,
+    incomeQueryTruncated: incomeResult.truncated,
+  };
+}
+
+async function fetchIncomeHistory(options) {
+  const result = [];
+  const limit = 1000;
+  const maxPages = 10;
+  let truncated = false;
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    const raw = await binanceSignedGet(
+      "/fapi/v1/income",
+      {
+        startTime: Math.floor(options.startTime),
+        endTime: Math.floor(options.endTime),
+        page,
+        limit,
+      },
+      options.credentials,
+      options.timeOffset,
+    );
+
+    for (const item of raw) {
+      const incomeType = String(item.incomeType || "");
+      const tranId = String(item.tranId || "");
+      const symbol = String(item.symbol || "");
+      const tradeId = String(item.tradeId || "");
+
+      result.push({
+        recordKey: sha256Hex(`${incomeType}:${tranId}`),
+        tradeKey:
+          symbol && tradeId ? sha256Hex(`${symbol}:${tradeId}`) : null,
+        symbol,
+        incomeType,
+        amount: toNumber(item.income),
+        asset: String(item.asset || ""),
+        info: String(item.info || ""),
+        time: Number(item.time || 0),
+      });
+    }
+
+    if (!Array.isArray(raw) || raw.length < limit) break;
+    if (page === maxPages) truncated = true;
+  }
+
+  return {
+    records: result,
+    truncated,
+  };
+}
+
+async function fetchTradesForSymbols(options) {
+  const result = [];
+  const sevenDaysMinusOneMinute =
+    7 * 24 * 60 * 60 * 1000 - 60 * 1000;
+  let truncated = false;
+
+  for (const symbol of options.symbols) {
+    let windowStart = options.startTime;
+
+    while (windowStart <= options.endTime) {
+      const windowEnd = Math.min(
+        options.endTime,
+        windowStart + sevenDaysMinusOneMinute,
+      );
+
+      const raw = await binanceSignedGet(
+        "/fapi/v1/userTrades",
+        {
+          symbol,
+          startTime: Math.floor(windowStart),
+          endTime: Math.floor(windowEnd),
+          limit: 1000,
+        },
+        options.credentials,
+        options.timeOffset,
+      );
+
+      if (Array.isArray(raw) && raw.length >= 1000) {
+        truncated = true;
+      }
+
+      for (const item of raw) {
+        const id = String(item.id || "");
+        const tradeKey = sha256Hex(`${symbol}:${id}`);
+
+        result.push({
+          recordKey: tradeKey,
+          tradeKey,
+          symbol,
+          side: String(item.side || ""),
+          positionSide: String(item.positionSide || ""),
+          price: toNumber(item.price),
+          quantity: toNumber(item.qty),
+          quoteQuantity: toNumber(item.quoteQty),
+          realizedPnl: toNumber(item.realizedPnl),
+          commission: toNumber(item.commission),
+          commissionAsset: String(item.commissionAsset || ""),
+          maker: Boolean(item.maker),
