@@ -1,0 +1,250 @@
+// Binance USD-M Futures -> GitHub current snapshot + forward-only performance ledger
+// Runtime: Scriptable on iPhone
+// V4 starts tracking from the existing latest.json timestamp (or first V4 run) and does not backfill older history.
+
+const NAMESPACE = "binance.github.snapshot.v3";
+const KEY = {
+  binanceApiKey: `${NAMESPACE}.binanceApiKey`,
+  binanceApiSecret: `${NAMESPACE}.binanceApiSecret`,
+  githubToken: `${NAMESPACE}.githubToken`,
+  config: `${NAMESPACE}.config`,
+};
+
+const BINANCE_BASE = "https://fapi.binance.com";
+const GITHUB_API_VERSION = "2022-11-28";
+
+await main();
+
+async function main() {
+  try {
+    const command = String(args.shortcutParameter || "").trim().toLowerCase();
+
+    if (command === "clear") {
+      await clearConfiguration();
+      return;
+    }
+
+    if (command === "setup" || !hasCompleteConfiguration()) {
+      await runSetup();
+    }
+
+    const credentials = loadCredentials();
+    const cfg = loadConfig();
+    const paths = deriveLedgerPaths(cfg.path);
+
+    const previousLatest = await readGitHubJson({
+      token: credentials.githubToken,
+      owner: cfg.owner,
+      repo: cfg.repo,
+      branch: cfg.branch,
+      path: paths.latest,
+    });
+
+    const existingIndex = await readGitHubJson({
+      token: credentials.githubToken,
+      owner: cfg.owner,
+      repo: cfg.repo,
+      branch: cfg.branch,
+      path: paths.index,
+    });
+
+    const serverTimePayload = await requestJson(`${BINANCE_BASE}/fapi/v1/time`);
+    const serverTime = Number(serverTimePayload.serverTime);
+
+    if (!Number.isFinite(serverTime)) {
+      throw new Error("无法读取 Binance 服务器时间");
+    }
+
+    const timeOffset = serverTime - Date.now();
+    const snapshot = await buildSnapshot(credentials, serverTime, timeOffset);
+
+    const existingIndexData =
+      existingIndex && existingIndex.data ? existingIndex.data : null;
+    const previousLatestData =
+      previousLatest && previousLatest.data ? previousLatest.data : null;
+
+    const tracking = determineTrackingWindow({
+      existingIndex: existingIndexData,
+      previousLatest: previousLatestData,
+      currentSnapshot: snapshot,
+      serverTime,
+    });
+
+    const syncPayload = await collectForwardData({
+      credentials,
+      timeOffset,
+      startTime: tracking.queryStartTime,
+      endTime: serverTime,
+      currentSnapshot: snapshot,
+      existingIndex: existingIndexData,
+    });
+
+    const equityRecord = makeEquityRecord(snapshot);
+    const grouped = groupRecordsByMonth(
+      equityRecord,
+      syncPayload.income,
+      syncPayload.trades,
+    );
+
+    const monthSummaries = {
+      ...(
+        existingIndexData &&
+        existingIndexData.monthSummaries &&
+        typeof existingIndexData.monthSummaries === "object"
+          ? existingIndexData.monthSummaries
+          : {}
+      ),
+    };
+
+    const allMonths = new Set(
+      existingIndexData && Array.isArray(existingIndexData.months)
+        ? existingIndexData.months
+        : [],
+    );
+
+    let addedIncomeCount = 0;
+    let addedTradeCount = 0;
+    let addedEquityCount = 0;
+
+    const monthsToWrite = Object.keys(grouped).sort();
+
+    for (const month of monthsToWrite) {
+      const monthPath = `${paths.historyDir}/${month}.json`;
+      const existingMonth = await readGitHubJson({
+        token: credentials.githubToken,
+        owner: cfg.owner,
+        repo: cfg.repo,
+        branch: cfg.branch,
+        path: monthPath,
+      });
+
+      const mergeResult = mergeMonthlyLedger(
+        month,
+        existingMonth && existingMonth.data ? existingMonth.data : null,
+        grouped[month],
+      );
+
+      addedIncomeCount += mergeResult.addedIncomeCount;
+      addedTradeCount += mergeResult.addedTradeCount;
+      addedEquityCount += mergeResult.addedEquityCount;
+
+      await upsertGitHubFile({
+        token: credentials.githubToken,
+        owner: cfg.owner,
+        repo: cfg.repo,
+        branch: cfg.branch,
+        path: monthPath,
+        content: JSON.stringify(mergeResult.ledger, null, 2) + "\n",
+        message: `Update Binance ledger ${month} at ${snapshot.generatedAt}`,
+      });
+
+      allMonths.add(month);
+      monthSummaries[month] = mergeResult.ledger.summary;
+    }
+
+    const indexData = buildIndex({
+      existingIndex: existingIndexData,
+      previousLatest: previousLatestData,
+      snapshot,
+      tracking,
+      syncPayload,
+      paths,
+      months: Array.from(allMonths).sort(),
+      monthSummaries,
+    });
+
+    await upsertGitHubFile({
+      token: credentials.githubToken,
+      owner: cfg.owner,
+      repo: cfg.repo,
+      branch: cfg.branch,
+      path: paths.index,
+      content: JSON.stringify(indexData, null, 2) + "\n",
+      message: `Update Binance performance index ${snapshot.generatedAt}`,
+    });
+
+    snapshot.performanceSinceTracking = indexData.performanceSinceTracking;
+    snapshot.tracking = {
+      startedAt: indexData.startedAt,
+      lastSyncAt: indexData.lastSyncAt,
+      indexPath: paths.index,
+      historyMonths: indexData.months,
+      dataGapDetected: Boolean(indexData.dataQuality.dataGapDetected),
+    };
+
+    const uploadResult = await upsertGitHubFile({
+      token: credentials.githubToken,
+      owner: cfg.owner,
+      repo: cfg.repo,
+      branch: cfg.branch,
+      path: paths.latest,
+      content: JSON.stringify(snapshot, null, 2) + "\n",
+      message: `Update Binance snapshot ${snapshot.generatedAt}`,
+    });
+
+    const result = {
+      ok: true,
+      generatedAt: snapshot.generatedAt,
+      trackingStartedAt: indexData.startedAt,
+      positions: snapshot.summary.activePositionCount,
+      ordinaryOrders: snapshot.summary.openOrderCount,
+      conditionalOrders: snapshot.summary.openAlgoOrderCount,
+      newIncomeRecords: addedIncomeCount,
+      newTradeRecords: addedTradeCount,
+      newEquitySnapshots: addedEquityCount,
+      adjustedProfitUSDT:
+        indexData.performanceSinceTracking.adjustedEquityProfitUSDT,
+      githubPath: `${cfg.owner}/${cfg.repo}/${paths.latest}`,
+      indexPath: `${cfg.owner}/${cfg.repo}/${paths.index}`,
+      commit: uploadResult.commitSha,
+      warnings: indexData.dataQuality.warnings,
+    };
+
+    Script.setShortcutOutput(JSON.stringify(result));
+    await showSuccess(result);
+  } catch (error) {
+    const message = safeErrorMessage(error);
+    console.error(message);
+    Script.setShortcutOutput(JSON.stringify({ ok: false, error: message }));
+    await showFailure(message);
+  } finally {
+    Script.complete();
+  }
+}
+
+function hasCompleteConfiguration() {
+  return Object.values(KEY).every((key) => Keychain.contains(key));
+}
+
+function loadCredentials() {
+  return {
+    binanceApiKey: Keychain.get(KEY.binanceApiKey),
+    binanceApiSecret: Keychain.get(KEY.binanceApiSecret),
+    githubToken: Keychain.get(KEY.githubToken),
+  };
+}
+
+function loadConfig() {
+  const cfg = JSON.parse(Keychain.get(KEY.config));
+  return {
+    owner: String(cfg.owner || "").trim(),
+    repo: String(cfg.repo || "").trim(),
+    branch: String(cfg.branch || "main").trim(),
+    path: String(cfg.path || "binance/latest.json").replace(/^\/+/, ""),
+  };
+}
+
+async function runSetup() {
+  const existing = Keychain.contains(KEY.config)
+    ? JSON.parse(Keychain.get(KEY.config))
+    : {};
+
+  const secretAlert = new Alert();
+  secretAlert.title = "账户密钥设置";
+  secretAlert.message = "所有密钥仅写入 Scriptable Keychain，不会上传到 GitHub。";
+  secretAlert.addTextField("Binance API Key", "");
+  secretAlert.addSecureTextField("Binance API Secret", "");
+  secretAlert.addSecureTextField("GitHub Fine-grained Token", "");
+  secretAlert.addAction("下一步");
+  secretAlert.addCancelAction("取消");
+
