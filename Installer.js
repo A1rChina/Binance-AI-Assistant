@@ -1,38 +1,39 @@
 // Binance AI Assistant - Scriptable installer/updater
 // Copy this file into Scriptable once. Re-run it whenever you want to update.
 
-const SOURCE_URL =
-  "https://raw.githubusercontent.com/A1rChina/Binance-AI-Assistant/main/src/BinanceSync.js";
+const RAW_BASE =
+  "https://raw.githubusercontent.com/A1rChina/Binance-AI-Assistant/main/src";
+const MANIFEST_URL = `${RAW_BASE}/manifest.json`;
 const SCRIPT_NAME = "Binance Sync";
-const EXPECTED_MARKER = "Binance USD-M Futures -> GitHub current snapshot";
 
 await main();
 
 async function main() {
   try {
     const location = await chooseLocation();
-    if (!location) {
-      Script.complete();
-      return;
-    }
+    if (!location) return;
 
     const fm = location === "icloud" ? FileManager.iCloud() : FileManager.local();
     const targetPath = fm.joinPath(fm.documentsDirectory(), `${SCRIPT_NAME}.js`);
 
-    const source = await downloadSource();
-    validateSource(source);
+    const manifest = await downloadManifest();
+    const source = await downloadParts(manifest);
+    validateSource(source, manifest);
 
     const backupPath = backupExistingScript(fm, targetPath);
     fm.writeString(targetPath, source);
 
     const result = {
       ok: true,
+      version: manifest.version,
       scriptName: SCRIPT_NAME,
       location,
       targetPath,
       backupPath,
       installedAt: new Date().toISOString(),
-      source: SOURCE_URL,
+      manifest: MANIFEST_URL,
+      partCount: manifest.parts.length,
+      sourceLength: source.length,
     };
 
     Script.setShortcutOutput(JSON.stringify(result));
@@ -63,8 +64,45 @@ async function chooseLocation() {
   return null;
 }
 
-async function downloadSource() {
-  const request = new Request(SOURCE_URL);
+async function downloadManifest() {
+  const text = await downloadText(MANIFEST_URL, "安装清单");
+  let manifest;
+
+  try {
+    manifest = JSON.parse(text);
+  } catch (_) {
+    throw new Error("安装清单不是有效 JSON。");
+  }
+
+  if (
+    !manifest ||
+    !Array.isArray(manifest.parts) ||
+    manifest.parts.length === 0 ||
+    !Number.isFinite(Number(manifest.length)) ||
+    typeof manifest.marker !== "string"
+  ) {
+    throw new Error("安装清单字段不完整。");
+  }
+
+  return manifest;
+}
+
+async function downloadParts(manifest) {
+  const chunks = [];
+
+  for (let index = 0; index < manifest.parts.length; index += 1) {
+    const relativePath = String(manifest.parts[index]).replace(/^\/+/, "");
+    const url = `${RAW_BASE}/${relativePath}`;
+    const label = `代码片段 ${index + 1}/${manifest.parts.length}`;
+    chunks.push(await downloadText(url, label));
+  }
+
+  return chunks.join("");
+}
+
+async function downloadText(url, label) {
+  const separator = url.includes("?") ? "&" : "?";
+  const request = new Request(`${url}${separator}t=${Date.now()}`);
   request.method = "GET";
   request.timeoutInterval = 30;
   request.headers = {
@@ -76,19 +114,27 @@ async function downloadSource() {
   const status = request.response ? request.response.statusCode : 0;
 
   if (status < 200 || status >= 300) {
-    throw new Error(`下载主脚本失败 HTTP ${status}`);
+    throw new Error(`${label}下载失败 HTTP ${status}`);
   }
 
   return text;
 }
 
-function validateSource(source) {
-  if (typeof source !== "string" || source.length < 10000) {
-    throw new Error("下载内容长度异常，未写入 Scriptable。");
+function validateSource(source, manifest) {
+  const expectedLength = Number(manifest.length);
+
+  if (typeof source !== "string" || source.length !== expectedLength) {
+    throw new Error(
+      `代码长度校验失败：期望 ${expectedLength}，实际 ${source.length}。`,
+    );
   }
 
-  if (!source.includes(EXPECTED_MARKER)) {
-    throw new Error("下载内容校验失败，未写入 Scriptable。");
+  if (!source.includes(manifest.marker)) {
+    throw new Error("代码标记校验失败，未写入 Scriptable。");
+  }
+
+  if (!source.includes("await main();") || !source.includes("Script.complete();")) {
+    throw new Error("主脚本结构校验失败，未写入 Scriptable。");
   }
 }
 
@@ -128,8 +174,10 @@ async function showSuccess(result) {
   const alert = new Alert();
   alert.title = "安装/更新完成";
   alert.message = [
+    `版本：${result.version}`,
     `脚本：${result.scriptName}`,
     `位置：${result.location === "icloud" ? "iCloud" : "本机"}`,
+    `代码片段：${result.partCount}`,
     result.backupPath ? "旧版本已备份到 Backups。" : "这是首次安装。",
     "以后重新运行此安装器即可更新。",
   ].join("\n");
