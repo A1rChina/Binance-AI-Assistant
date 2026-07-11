@@ -1,0 +1,233 @@
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function requestJson(url, headers = {}) {
+  const request = new Request(url);
+  request.method = "GET";
+  request.headers = headers;
+  request.timeoutInterval = 20;
+
+  const text = await request.loadString();
+  const status = request.response ? request.response.statusCode : 0;
+  const data = parseJson(text);
+
+  if (status < 200 || status >= 300) {
+    const detail = data && data.msg ? data.msg : text.slice(0, 300);
+    throw new Error(`请求失败 HTTP ${status}：${detail}`);
+  }
+
+  return data;
+}
+
+async function readGitHubJson(options) {
+  const encodedPath = options.path
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  const url =
+    `https://api.github.com/repos/${encodeURIComponent(options.owner)}` +
+    `/${encodeURIComponent(options.repo)}/contents/${encodedPath}` +
+    `?ref=${encodeURIComponent(options.branch)}`;
+
+  const request = new Request(url);
+  request.method = "GET";
+  request.headers = githubHeaders(options.token);
+  request.timeoutInterval = 20;
+
+  const text = await request.loadString();
+  const status = request.response ? request.response.statusCode : 0;
+
+  if (status === 404) return null;
+
+  if (status < 200 || status >= 300) {
+    const detail = parseJson(text);
+    throw new Error(
+      `读取 GitHub JSON 失败 HTTP ${status}：${
+        detail && detail.message ? detail.message : text.slice(0, 300)
+      }`,
+    );
+  }
+
+  const payload = parseJson(text);
+  if (!payload || typeof payload.content !== "string") {
+    throw new Error(`GitHub 文件 ${options.path} 没有可解码的内容`);
+  }
+
+  const compactBase64 = payload.content.replace(/\s+/g, "");
+  const decodedData = Data.fromBase64String(compactBase64);
+  const decodedText = decodedData ? decodedData.toRawString() : null;
+  const data = decodedText ? parseJson(decodedText) : null;
+
+  if (!data) {
+    throw new Error(`GitHub 文件 ${options.path} 不是有效 JSON`);
+  }
+
+  return {
+    data,
+    sha: payload.sha || null,
+  };
+}
+
+async function upsertGitHubFile(options) {
+  const encodedPath = options.path
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  const baseUrl = `https://api.github.com/repos/${encodeURIComponent(options.owner)}/${encodeURIComponent(options.repo)}/contents/${encodedPath}`;
+  const headers = githubHeaders(options.token);
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let existingSha = null;
+
+    const getRequest = new Request(
+      `${baseUrl}?ref=${encodeURIComponent(options.branch)}`,
+    );
+    getRequest.method = "GET";
+    getRequest.headers = headers;
+    getRequest.timeoutInterval = 20;
+
+    const getText = await getRequest.loadString();
+    const getStatus = getRequest.response ? getRequest.response.statusCode : 0;
+
+    if (getStatus === 200) {
+      const current = parseJson(getText);
+      existingSha = current.sha;
+    } else if (getStatus !== 404) {
+      const detail = parseJson(getText);
+      throw new Error(
+        `读取 GitHub 文件失败 HTTP ${getStatus}：${
+          detail && detail.message ? detail.message : getText.slice(0, 300)
+        }`,
+      );
+    }
+
+    const body = {
+      message: options.message,
+      content: Data.fromString(options.content).toBase64String(),
+      branch: options.branch,
+    };
+    if (existingSha) body.sha = existingSha;
+
+    const putRequest = new Request(baseUrl);
+    putRequest.method = "PUT";
+    putRequest.headers = {
+      ...headers,
+      "Content-Type": "application/json",
+    };
+    putRequest.body = JSON.stringify(body);
+    putRequest.timeoutInterval = 20;
+
+    const putText = await putRequest.loadString();
+    const putStatus = putRequest.response ? putRequest.response.statusCode : 0;
+    const putData = parseJson(putText);
+
+    if (putStatus === 200 || putStatus === 201) {
+      return {
+        commitSha: putData.commit ? putData.commit.sha : null,
+        fileSha: putData.content ? putData.content.sha : null,
+      };
+    }
+
+    if (putStatus === 409 && attempt === 1) continue;
+
+    const githubMessage =
+      putData && putData.message ? putData.message : putText.slice(0, 300);
+
+    if (
+      putStatus === 422 &&
+      /branch|reference|empty|object does not exist/i.test(githubMessage)
+    ) {
+      throw new Error(
+        `GitHub 仓库尚无可写分支：${githubMessage}。请先在 sa 仓库创建 README，确认默认分支为 main，再重新运行脚本。`,
+      );
+    }
+
+    throw new Error(
+      `写入 GitHub 失败 HTTP ${putStatus}：${githubMessage}`,
+    );
+  }
+
+  throw new Error("GitHub 文件更新冲突，请重新运行脚本");
+}
+
+function githubHeaders(token) {
+  return {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${token}`,
+    "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    "User-Agent": "Scriptable-Binance-Snapshot",
+  };
+}
+
+function parseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return null;
+  }
+}
+
+function toNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function sum(values) {
+  return values.reduce((total, value) => total + toNumber(value), 0);
+}
+
+function safeErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, 800);
+}
+
+async function showSuccess(result) {
+  const profit =
+    result.adjustedProfitUSDT === null ||
+    result.adjustedProfitUSDT === undefined
+      ? "暂不可算"
+      : Number(result.adjustedProfitUSDT).toFixed(4);
+
+  const lines = [
+    `持仓：${result.positions}`,
+    `新增资金流水：${result.newIncomeRecords}`,
+    `新增成交：${result.newTradeRecords}`,
+    `追踪后调整利润：${profit} USDT`,
+    `文件：${result.githubPath}`,
+  ];
+
+  if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+    lines.push(`警告：${result.warnings[0]}`);
+  }
+
+  const message = lines.join("\n");
+
+  if (config.runsInApp) {
+    const alert = new Alert();
+    alert.title = "Binance 数据已同步";
+    alert.message = message;
+    alert.addAction("完成");
+    await alert.presentAlert();
+  } else {
+    const notification = new Notification();
+    notification.title = "Binance 数据已同步";
+    notification.body = message;
+    await notification.schedule();
+  }
+}
+
+async function showFailure(message) {
+  if (config.runsInApp) {
+    const alert = new Alert();
+    alert.title = "同步失败";
+    alert.message = message;
+    alert.addAction("关闭");
+    await alert.presentAlert();
+  } else {
+    const notification = new Notification();
+    notification.title = "Binance 快照同步失败";
+    notification.body = message;
+    await notification.schedule();
+  }
+}
