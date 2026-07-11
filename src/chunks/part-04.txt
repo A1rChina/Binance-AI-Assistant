@@ -1,0 +1,266 @@
+          buyer: Boolean(item.buyer),
+          time: Number(item.time || 0),
+        });
+      }
+
+      if (windowEnd >= options.endTime) break;
+      windowStart = windowEnd + 1;
+    }
+  }
+
+  return {
+    records: result,
+    truncated,
+  };
+}
+
+function symbolsFromSnapshot(snapshot) {
+  const values = [];
+  const positions = Array.isArray(snapshot.positions) ? snapshot.positions : [];
+  const ordinary =
+    snapshot.orders && Array.isArray(snapshot.orders.ordinary)
+      ? snapshot.orders.ordinary
+      : [];
+  const conditional =
+    snapshot.orders && Array.isArray(snapshot.orders.conditional)
+      ? snapshot.orders.conditional
+      : [];
+
+  for (const item of positions.concat(ordinary, conditional)) {
+    if (item.symbol) values.push(String(item.symbol));
+  }
+
+  return Array.from(new Set(values)).sort();
+}
+
+function makeEquityRecord(snapshot) {
+  const summary = snapshot.summary || {};
+  const record = {
+    time: Date.parse(snapshot.generatedAt),
+    generatedAt: snapshot.generatedAt,
+    walletBalanceUSDT: toNumber(summary.walletBalanceUSDT),
+    estimatedEquityUSDT: toNumber(summary.estimatedEquityUSDT),
+    availableBalanceUSDT: toNumber(summary.availableBalanceUSDT),
+    unrealizedPnlUSDT: toNumber(summary.positionUnrealizedPnlUSDT),
+    initialMarginUSDT: toNumber(summary.initialMarginUSDT),
+    maintenanceMarginUSDT: toNumber(summary.maintenanceMarginUSDT),
+    grossNotionalUSDT: toNumber(summary.grossNotionalUSDT),
+    netNotionalUSDT: toNumber(summary.netNotionalUSDT),
+    activePositionCount: toNumber(summary.activePositionCount),
+  };
+
+  return {
+    recordKey: sha256Hex(
+      [
+        record.generatedAt,
+        record.walletBalanceUSDT,
+        record.estimatedEquityUSDT,
+        record.grossNotionalUSDT,
+      ].join("|"),
+    ),
+    ...record,
+  };
+}
+
+function groupRecordsByMonth(equityRecord, income, trades) {
+  const grouped = {};
+
+  function ensure(month) {
+    if (!grouped[month]) {
+      grouped[month] = {
+        equitySnapshots: [],
+        income: [],
+        trades: [],
+      };
+    }
+    return grouped[month];
+  }
+
+  ensure(monthKey(equityRecord.time)).equitySnapshots.push(equityRecord);
+
+  for (const item of income) {
+    ensure(monthKey(item.time)).income.push(item);
+  }
+
+  for (const item of trades) {
+    ensure(monthKey(item.time)).trades.push(item);
+  }
+
+  return grouped;
+}
+
+function mergeMonthlyLedger(month, existing, incoming) {
+  const base =
+    existing && typeof existing === "object"
+      ? existing
+      : {
+          schemaVersion: 1,
+          exchange: "binance",
+          market: "USD_M_FUTURES",
+          month,
+          equitySnapshots: [],
+          income: [],
+          trades: [],
+        };
+
+  const equityMerge = mergeUniqueRecords(
+    Array.isArray(base.equitySnapshots) ? base.equitySnapshots : [],
+    incoming.equitySnapshots || [],
+  );
+  const incomeMerge = mergeUniqueRecords(
+    Array.isArray(base.income) ? base.income : [],
+    incoming.income || [],
+  );
+  const tradeMerge = mergeUniqueRecords(
+    Array.isArray(base.trades) ? base.trades : [],
+    incoming.trades || [],
+  );
+
+  const ledger = {
+    schemaVersion: 1,
+    exchange: "binance",
+    market: "USD_M_FUTURES",
+    month,
+    equitySnapshots: equityMerge.records.sort((a, b) => a.time - b.time),
+    income: incomeMerge.records.sort((a, b) => a.time - b.time),
+    trades: tradeMerge.records.sort((a, b) => a.time - b.time),
+  };
+
+  ledger.summary = summarizeMonthlyLedger(ledger);
+
+  return {
+    ledger,
+    addedEquityCount: equityMerge.addedCount,
+    addedIncomeCount: incomeMerge.addedCount,
+    addedTradeCount: tradeMerge.addedCount,
+  };
+}
+
+function mergeUniqueRecords(existing, incoming) {
+  const map = new Map();
+
+  for (const item of existing.concat(incoming)) {
+    if (!item || !item.recordKey) continue;
+    map.set(item.recordKey, item);
+  }
+
+  const existingKeys = new Set(
+    existing.filter((item) => item && item.recordKey).map((item) => item.recordKey),
+  );
+  const addedCount = incoming.filter(
+    (item) => item && item.recordKey && !existingKeys.has(item.recordKey),
+  ).length;
+
+  return {
+    records: Array.from(map.values()),
+    addedCount,
+  };
+}
+
+function summarizeMonthlyLedger(ledger) {
+  const incomeByType = {};
+
+  for (const item of ledger.income) {
+    const type = item.incomeType || "UNKNOWN";
+    incomeByType[type] = toNumber(incomeByType[type]) + toNumber(item.amount);
+  }
+
+  const nonTransferIncome = Object.keys(incomeByType)
+    .filter((type) => type !== "TRANSFER")
+    .reduce((total, type) => total + toNumber(incomeByType[type]), 0);
+
+  const times = [];
+  for (const item of ledger.equitySnapshots.concat(ledger.income, ledger.trades)) {
+    if (Number.isFinite(Number(item.time))) times.push(Number(item.time));
+  }
+
+  return {
+    firstRecordAt:
+      times.length > 0 ? new Date(Math.min(...times)).toISOString() : null,
+    lastRecordAt:
+      times.length > 0 ? new Date(Math.max(...times)).toISOString() : null,
+    equitySnapshotCount: ledger.equitySnapshots.length,
+    incomeRecordCount: ledger.income.length,
+    tradeRecordCount: ledger.trades.length,
+    incomeByType,
+    realizedPnlUSDT: toNumber(incomeByType.REALIZED_PNL),
+    commissionUSDT: toNumber(incomeByType.COMMISSION),
+    fundingFeeUSDT: toNumber(incomeByType.FUNDING_FEE),
+    transferUSDT: toNumber(incomeByType.TRANSFER),
+    netIncomeExcludingTransfersUSDT: nonTransferIncome,
+  };
+}
+
+function buildIndex(options) {
+  const incomeByType = {};
+  let totalEquitySnapshots = 0;
+  let totalIncomeRecords = 0;
+  let totalTradeRecords = 0;
+
+  for (const month of options.months) {
+    const summary = options.monthSummaries[month];
+    if (!summary) continue;
+
+    totalEquitySnapshots += toNumber(summary.equitySnapshotCount);
+    totalIncomeRecords += toNumber(summary.incomeRecordCount);
+    totalTradeRecords += toNumber(summary.tradeRecordCount);
+
+    const monthTypes =
+      summary.incomeByType && typeof summary.incomeByType === "object"
+        ? summary.incomeByType
+        : {};
+
+    for (const type of Object.keys(monthTypes)) {
+      incomeByType[type] =
+        toNumber(incomeByType[type]) + toNumber(monthTypes[type]);
+    }
+  }
+
+  const netTransfers = toNumber(incomeByType.TRANSFER);
+  const netIncomeExcludingTransfers = Object.keys(incomeByType)
+    .filter((type) => type !== "TRANSFER")
+    .reduce((total, type) => total + toNumber(incomeByType[type]), 0);
+
+  const baseline = options.tracking.baseline;
+  const currentEquity = toNumber(
+    options.snapshot.summary.estimatedEquityUSDT,
+  );
+  const adjustedEquityProfit =
+    currentEquity -
+    toNumber(baseline.estimatedEquityUSDT) -
+    netTransfers;
+
+  const warnings = [];
+  if (options.tracking.dataGapDetected) {
+    warnings.push(
+      "距离上次成功同步超过资金流水接口可回溯窗口，可能存在未归档的数据缺口。",
+    );
+  }
+  for (const warning of options.syncPayload.warnings || []) {
+    warnings.push(warning);
+  }
+  if (
+    baseline.preExistingPositions &&
+    baseline.preExistingPositions.length > 0
+  ) {
+    warnings.push(
+      "追踪开始时已有持仓；这些持仓的完整开仓成交不在账本内，首轮交易级统计应谨慎解释。",
+    );
+  }
+
+  return {
+    schemaVersion: 1,
+    exchange: "binance",
+    market: "USD_M_FUTURES",
+    trackingMode: "forward_only",
+    startedAt: options.tracking.startedAt,
+    lastSyncAt: options.snapshot.generatedAt,
+    baseline,
+    latestPath: options.paths.latest,
+    historyDirectory: options.paths.historyDir,
+    months: options.months,
+    monthSummaries: options.monthSummaries,
+    knownSymbols: options.syncPayload.knownSymbols,
+    totals: {
+      equitySnapshotCount: totalEquitySnapshots,
+      incomeRecordCount: totalIncomeRecords,
